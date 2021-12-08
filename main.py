@@ -1,12 +1,10 @@
 import argparse
 import torch
-import numpy as np
 import os
 from tqdm import tqdm
 from dataset import BaseDataset, GraphDataset
 from model import TKGraphormer
 import logging
-import datetime
 from collections import namedtuple
 
 def set_logger(log_file):
@@ -62,7 +60,7 @@ def test(model, test_graphdataset, skip_dict):
                 answer_prob = predict_score[dst]
                 for e in skip_dict[(src, rel, time)]:
                     if e != dst:
-                        predict_score[e] = 10e-8
+                        predict_score[e] = -1e6
                 predict_score.sort(reverse=True)
                 rank = predict_score.index(answer_prob) + 1
 
@@ -106,6 +104,8 @@ def main(args):
     else:
         device = 'cpu'
 
+    logging.info(device)
+
     # 数据集读取
     data_path = os.path.join(args.data_root, args.data)
     trainpath = os.path.join(data_path, 'train.txt')
@@ -118,19 +118,20 @@ def main(args):
         time_span = 24
     else:
         time_span = 1
-    train_graphdataset = GraphDataset(baseDataset.train_snapshots, 0, baseDataset.num_e, baseDataset.num_r, args.history_len, device)
+    train_graphdataset = GraphDataset(baseDataset.train_snapshots, 1, baseDataset.num_e, baseDataset.num_r, args.history_len, device)
     valid_start_idx = baseDataset.valid_snapshots[0][1] // time_span
-    valid_graphdataset = GraphDataset(baseDataset.train_snapshots, valid_start_idx, baseDataset.num_e,
+    valid_graphdataset = GraphDataset(baseDataset.train_snapshots + baseDataset.valid_snapshots, valid_start_idx, baseDataset.num_e,
                                       baseDataset.num_r, args.history_len, device)
     test_start_idx = baseDataset.test_snapshots[0][1] // time_span
-    test_graphdataset = GraphDataset(baseDataset.train_snapshots, test_start_idx, baseDataset.num_e, baseDataset.num_r,
+    test_graphdataset = GraphDataset(baseDataset.train_snapshots + baseDataset.valid_snapshots + baseDataset.test_snapshots,
+                                     test_start_idx, baseDataset.num_e, baseDataset.num_r,
                                      args.history_len, device)
 
     # 模型创建
     Config = namedtuple('config', ['n_ent', 'ent_dim', 'n_rel', 'rel_dim', 'lstm_hidden_dim'])
     config = Config(n_ent=baseDataset.num_e,
                     ent_dim=args.ent_dim,
-                    n_rel=baseDataset.num_r,
+                    n_rel=baseDataset.num_r*2,
                     rel_dim=args.rel_dim,
                     lstm_hidden_dim=args.lstm_hidden_dim)
     model = TKGraphormer(config)

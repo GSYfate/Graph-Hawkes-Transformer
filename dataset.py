@@ -61,15 +61,12 @@ class BaseDataset(object):
         with open(inpath, 'r') as f:
             quadrupleList = []
             for line in f:
-                try:
-                    line_split = line.split()
-                    head = int(line_split[0])
-                    rel = int(line_split[1])
-                    tail = int(line_split[2])
-                    time = int(line_split[3])
-                    quadrupleList.append([head, rel, tail, time])
-                except:
-                    print(line)
+                line_split = line.split()
+                head = int(line_split[0])
+                rel = int(line_split[1])
+                tail = int(line_split[2])
+                time = int(line_split[3])
+                quadrupleList.append([head, rel, tail, time])
         return quadrupleList
 
     @staticmethod
@@ -128,28 +125,26 @@ class GraphDataset(torch.utils.data.Dataset):
         self.snapshots_num = len(snapshots)
         self.snapshots = snapshots
         self.device = device
-        self.dgl_graphs = [self.build_sub_graph(n_ent, n_rel, g, device) for g, _ in snapshots]
+        self.dgl_graphs = [self.build_sub_graph(n_ent, n_rel, g, time, device) for g, time in snapshots]
 
     def __len__(self):
         return self.snapshots_num - self.start_idx
 
     def __getitem__(self, idx):
-        predict_snapshots, timestamp = self.snapshots[idx + 1]
-        if idx - self.history_len < 0:
-            graph_list = self.dgl_graphs[:idx]
-        else:
-            graph_list = self.dgl_graphs[idx - self.history_len: idx]
+        index = self.start_idx + idx
+        predict_snapshots, timestamp = self.snapshots[index]
+        graph_list = self.dgl_graphs[max(0, index - self.history_len): index]
         query_entites = torch.tensor(predict_snapshots[:, 0], device=self.device)
         query_relations = torch.tensor(predict_snapshots[:, 1], device=self.device)
         query_timestamps = torch.ones_like(query_entites) * timestamp
         answers = torch.tensor(predict_snapshots[:, 2], device=self.device)
         return graph_list, query_entites, query_relations, query_timestamps, answers
 
-    def build_sub_graph(self, num_nodes, num_rels, triples, device):
+    def build_sub_graph(self, num_nodes, num_rels, triples, time, device):
         # 针对每一个snapshot, 构建dgl图
         src, rel, dst = triples.transpose()
         src, dst = np.concatenate((src, dst)), np.concatenate((dst, src))
-        rel = np.concatenate((rel, rel + num_rels)) # 加入取反边
+        rel = np.concatenate((rel, rel + num_rels))  # 加入取反边
         g = dgl.DGLGraph()
         g.add_nodes(num_nodes)
         g.add_edges(src, dst)
@@ -158,6 +153,7 @@ class GraphDataset(torch.utils.data.Dataset):
         g.ndata.update({'id': node_id, 'norm': norm.view(-1, 1)})
         g.apply_edges(lambda edges: {'norm': edges.dst['norm'] * edges.src['norm']})
         g.edata['type'] = torch.LongTensor(rel)
+        g.edata['timestamp'] = torch.LongTensor(torch.ones_like(g.edata['type']) * time)
         return g.to(device)
 
     def comp_deg_norm(self, g):
@@ -181,33 +177,42 @@ if __name__ == '__main__':
     baseDataset.sanity_check(baseDataset.valid_snapshots)
 
     # dataset 测试
-    train_graphdataset = GraphDataset(baseDataset.train_snapshots, 0, baseDataset.num_e, baseDataset.num_r, 10)
+    train_graphdataset = GraphDataset(baseDataset.train_snapshots, 1, baseDataset.num_e, baseDataset.num_r, 10, 'cpu')
     print('-----train-----')
     for graph_list, query_entities, query_relations, query_timestamps, answers in train_graphdataset:
+        print(graph_list[-1].edata['timestamp'])
         print(len(graph_list))
-        print(query_entities.shape)
-        print(query_relations.shape)
-        print(query_timestamps.shape)
-        print(answers.shape)
+        print(query_entities)
+        print(query_relations)
+        print(query_timestamps)
+        print(answers)
+        break
 
     time_span = 24
     print('-----valid-----')
     valid_start_idx = baseDataset.valid_snapshots[0][1] // time_span
-    valid_graphdataset = GraphDataset(baseDataset.train_snapshots, valid_start_idx, baseDataset.num_e, baseDataset.num_r, 10)
+    valid_graphdataset = GraphDataset(baseDataset.train_snapshots + baseDataset.valid_snapshots,
+                                      valid_start_idx, baseDataset.num_e, baseDataset.num_r, 10, 'cpu')
     for graph_list, query_entities, query_relations, query_timestamps, answers in valid_graphdataset:
+        print(graph_list[-1].edata['timestamp'])
         print(len(graph_list))
-        print(query_entities.shape)
-        print(query_relations.shape)
-        print(query_timestamps.shape)
-        print(answers.shape)
+        print(query_entities)
+        print(query_relations)
+        print(query_timestamps)
+        print(answers)
+        break
 
     time_span = 24
     print('-----test-----')
     test_start_idx = baseDataset.test_snapshots[0][1] // time_span
-    test_graphdataset = GraphDataset(baseDataset.train_snapshots, test_start_idx, baseDataset.num_e, baseDataset.num_r, 10)
+    print(test_start_idx)
+    test_graphdataset = GraphDataset(baseDataset.train_snapshots + baseDataset.valid_snapshots + baseDataset.test_snapshots,
+                                     test_start_idx, baseDataset.num_e, baseDataset.num_r, 10, 'cpu')
     for graph_list, query_entities, query_relations, query_timestamps, answers in test_graphdataset:
+        print(graph_list[-1].edata['timestamp'])
         print(len(graph_list))
-        print(query_entities.shape)
-        print(query_relations.shape)
-        print(query_timestamps.shape)
-        print(answers.shape)
+        print(query_entities)
+        print(query_relations)
+        print(query_timestamps)
+        print(answers)
+        break
