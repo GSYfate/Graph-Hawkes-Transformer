@@ -1,9 +1,10 @@
 import os.path
 from collections import defaultdict
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import dgl
 import torch
+
 
 class BaseDataset(object):
     def __init__(self, trainpath, testpath, statpath, validpath):
@@ -102,6 +103,16 @@ class BaseDataset(object):
         return snapshot_list
 
     @staticmethod
+    def get_reverse_quadruples_array(quadruples, num_r):
+        quads = np.array(quadruples)
+        quads_r = np.zeros_like(quads)
+        quads_r[:, 1] = num_r + quads[:, 1]
+        quads_r[:, 0] = quads[:, 2]
+        quads_r[:, 2] = quads[:, 0]
+        quads_r[:, 3] = quads[:, 3]
+        return np.concatenate((quads, quads_r))
+
+    @staticmethod
     def sanity_check(snapshot_list):
         nodes = []
         rels = []
@@ -116,35 +127,23 @@ class BaseDataset(object):
                         max([len(_) for _ in snapshot_list]), min([len(_) for _ in snapshot_list])))
 
 
-class GraphDataset(torch.utils.data.Dataset):
-    def __init__(self, snapshots, start_idx, n_ent, n_rel, history_len, device):
+class DGLGraphDataset(object):
+    def __init__(self, snapshots, n_ent, n_rel):
         self.n_ent = n_ent
         self.n_rel = n_rel
-        self.history_len = history_len  # 用于建模的历史快照长度
-        self.start_idx = start_idx  # 用于预测的开始时间戳idx
         self.snapshots_num = len(snapshots)
         self.snapshots = snapshots
-        self.device = device
-        self.dgl_graphs = [self.build_sub_graph(n_ent, n_rel, g, time, device) for g, time in snapshots]
+        self.dgl_graphs = [self.build_sub_graph(n_ent, n_rel, g, time) for g, time in snapshots]
+        self.dgl_graphs.insert(0, self.build_sub_graph(n_ent, n_rel, np.array([]), 0))  # 添加PAD Graph, 方便后面操作
 
-    def __len__(self):
-        return self.snapshots_num - self.start_idx
-
-    def __getitem__(self, idx):
-        index = self.start_idx + idx
-        predict_snapshots, timestamp = self.snapshots[index]
-        graph_list = self.dgl_graphs[max(0, index - self.history_len): index]
-        query_entites = torch.tensor(predict_snapshots[:, 0], device=self.device)
-        query_relations = torch.tensor(predict_snapshots[:, 1], device=self.device)
-        query_timestamps = torch.ones_like(query_entites) * timestamp
-        answers = torch.tensor(predict_snapshots[:, 2], device=self.device)
-        return graph_list, query_entites, query_relations, query_timestamps, answers
-
-    def build_sub_graph(self, num_nodes, num_rels, triples, time, device):
+    def build_sub_graph(self, num_nodes, num_rels, triples, time):
         # 针对每一个snapshot, 构建dgl图
-        src, rel, dst = triples.transpose()
-        src, dst = np.concatenate((src, dst)), np.concatenate((dst, src))
-        rel = np.concatenate((rel, rel + num_rels))  # 加入取反边
+        if triples.size != 0:
+            src, rel, dst = triples.transpose()
+            src, dst = np.concatenate((src, dst)), np.concatenate((dst, src))
+            rel = np.concatenate((rel, rel + num_rels))  # 加入取反边
+        else:
+            src, rel, dst = np.array([]), np.array([]), np.array([])
         g = dgl.DGLGraph()
         g.add_nodes(num_nodes)
         g.add_edges(src, dst)
@@ -154,7 +153,7 @@ class GraphDataset(torch.utils.data.Dataset):
         g.apply_edges(lambda edges: {'norm': edges.dst['norm'] * edges.src['norm']})
         g.edata['type'] = torch.LongTensor(rel)
         g.edata['timestamp'] = torch.LongTensor(torch.ones_like(g.edata['type']) * time)
-        return g.to(device)
+        return g
 
     def comp_deg_norm(self, g):
         # 计算图中节点的度正则项
@@ -162,6 +161,79 @@ class GraphDataset(torch.utils.data.Dataset):
         in_deg[torch.nonzero(in_deg == 0).view(-1)] = 1
         norm = 1.0 / in_deg
         return norm
+
+
+class QuadruplesDataset(Dataset):
+    def __init__(self, quadruples, history_len, time_span):
+        self.quadruples = quadruples  # 四元组数组，np.array, [quad_num, 4] (sub, rel, obj, time)
+        self.history_len = history_len  # 预测答案依据的历史序列长度
+        self.time_span = time_span  # TKG的时间跨度，ICEWS是24
+
+    def __len__(self):
+        return len(self.quadruples)
+
+    def __getitem__(self, idx):
+        quad = self.quadruples[idx]
+        sub, rel, obj, time = quad[0], quad[1], quad[2], quad[3]
+        time = time // self.time_span
+        # 选择最近历史图的idx, 这里可以用其他的sample方法代替, 因为Graph list头部添加了一个空白图，所以Graph idx数值小于等于预测时间戳即可
+        history_list = [max(0, time - i) for i in range(self.history_len)]
+        return torch.tensor(sub), torch.tensor(rel), torch.tensor(obj), torch.tensor(time), torch.tensor(history_list)
+
+    @staticmethod
+    def collate_fn(data):
+        sub = torch.stack([_[0] for _ in data], dim=0)
+        rel = torch.stack([_[1] for _ in data], dim=0)
+        obj = torch.stack([_[2] for _ in data], dim=0)
+        time = torch.stack([_[3] for _ in data], dim=0)
+        history_list = torch.stack([_[4] for _ in data], dim=0)
+        uniq_history, history_align = np.unique(history_list.numpy(), return_inverse=True)  # 独立的历史
+        history_align = history_align.reshape([sub.shape[0], -1])
+        # graphs = [dgl_graphs[idx] for idx in uniq_history]
+        return sub, rel, obj, time, torch.tensor(history_align), uniq_history
+
+
+class QuadsInputByTimesDataset(Dataset):
+    def __init__(self, timeIDs, dglDataset, seq_len, num_sample_triples=0):
+        self.timeIDs = timeIDs  # 用于训练的时间戳ID
+        self.dglDataset = dglDataset
+        self.snapshots = [(self.get_reverse_triples(self.dglDataset.n_rel, g), t) for g, t in self.dglDataset.snapshots]
+        self.seq_len = seq_len
+        self.num_sample_triples = num_sample_triples
+
+    def __len__(self):
+        return len(self.timeIDs)
+
+    def __getitem__(self, idx):
+        timeid = self.timeIDs[idx]
+        predict_triples, predict_t = self.snapshots[timeid]
+        seq_graphs = [self.dglDataset.dgl_graphs[max(0, timeid-self.seq_len+1+i)] for i in range(self.seq_len)]
+        if self.num_sample_triples:
+            predict_triples = self.triples_sample(predict_triples)
+        predict_s = torch.tensor(predict_triples[:, 0])
+        predict_p = torch.tensor(predict_triples[:, 1])
+        predict_o = torch.tensor(predict_triples[:, 2])
+        predict_t = torch.ones_like(predict_s) * predict_t
+        return predict_s, predict_p, predict_o, predict_t, seq_graphs
+
+    def get_reverse_triples(self, num_r, triples):
+        triples_r = np.zeros_like(triples)
+        triples_r[:, 1] = num_r + triples[:, 1]
+        triples_r[:, 0] = triples[:, 2]
+        triples_r[:, 2] = triples[:, 0]
+        return np.concatenate((triples, triples_r))
+
+    def triples_sample(self, triples):
+        # 对三元组采样
+        if self.num_sample_triples < len(triples):
+            index = np.random.choice(range(len(triples)), self.num_sample_triples, False)
+            triples = triples[index]
+        return triples
+
+    @staticmethod
+    def collate_fn(data):
+        predict_s, predict_p, predict_o, predict_t, seq_graphs = data[0]
+        return predict_s, predict_p, predict_o, predict_t, seq_graphs
 
 
 if __name__ == '__main__':
@@ -176,43 +248,33 @@ if __name__ == '__main__':
     baseDataset.sanity_check(baseDataset.test_snapshots)
     baseDataset.sanity_check(baseDataset.valid_snapshots)
 
-    # dataset 测试
-    train_graphdataset = GraphDataset(baseDataset.train_snapshots, 1, baseDataset.num_e, baseDataset.num_r, 10, 'cpu')
-    print('-----train-----')
-    for graph_list, query_entities, query_relations, query_timestamps, answers in train_graphdataset:
-        print(graph_list[-1].edata['timestamp'])
-        print(len(graph_list))
-        print(query_entities)
-        print(query_relations)
-        print(query_timestamps)
-        print(answers)
+    dglGraphDataset = DGLGraphDataset(baseDataset.train_snapshots + baseDataset.valid_snapshots + baseDataset.test_snapshots,
+                                      baseDataset.num_e, baseDataset.num_r)
+    trainTimes = list(range(len(baseDataset.train_snapshots)))
+    quadsInputByTimeDataset = QuadsInputByTimesDataset(trainTimes, dglGraphDataset, 10)
+
+    dataloader = DataLoader(
+        quadsInputByTimeDataset,
+        shuffle=True,
+        batch_size=1,
+        num_workers=2,
+        collate_fn=QuadsInputByTimesDataset.collate_fn,
+    )
+
+    for predict_s, predict_p, predict_o, predict_t, seq_graphs in dataloader:
         break
 
-    time_span = 24
-    print('-----valid-----')
-    valid_start_idx = baseDataset.valid_snapshots[0][1] // time_span
-    valid_graphdataset = GraphDataset(baseDataset.train_snapshots + baseDataset.valid_snapshots,
-                                      valid_start_idx, baseDataset.num_e, baseDataset.num_r, 10, 'cpu')
-    for graph_list, query_entities, query_relations, query_timestamps, answers in valid_graphdataset:
-        print(graph_list[-1].edata['timestamp'])
-        print(len(graph_list))
-        print(query_entities)
-        print(query_relations)
-        print(query_timestamps)
-        print(answers)
-        break
+    testTimes = list(range(len(baseDataset.train_snapshots + baseDataset.valid_snapshots),
+                           len(baseDataset.train_snapshots + baseDataset.valid_snapshots + baseDataset.test_snapshots)))
+    testQuadsInputByTimeDataset = QuadsInputByTimesDataset(testTimes, dglGraphDataset, 5)
 
-    time_span = 24
-    print('-----test-----')
-    test_start_idx = baseDataset.test_snapshots[0][1] // time_span
-    print(test_start_idx)
-    test_graphdataset = GraphDataset(baseDataset.train_snapshots + baseDataset.valid_snapshots + baseDataset.test_snapshots,
-                                     test_start_idx, baseDataset.num_e, baseDataset.num_r, 10, 'cpu')
-    for graph_list, query_entities, query_relations, query_timestamps, answers in test_graphdataset:
-        print(graph_list[-1].edata['timestamp'])
-        print(len(graph_list))
-        print(query_entities)
-        print(query_relations)
-        print(query_timestamps)
-        print(answers)
-        break
+    testDataLoader = DataLoader(
+        testQuadsInputByTimeDataset,
+        batch_size=1,
+        num_workers=2,
+        collate_fn=QuadsInputByTimesDataset.collate_fn,
+    )
+
+    for predict_s, predict_p, predict_o, predict_t, seq_graphs in testDataLoader:
+        print(predict_t[0])
+        print(seq_graphs[-1].edata['timestamp'][0])

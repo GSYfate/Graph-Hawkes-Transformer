@@ -34,9 +34,10 @@ class InforDecoder(nn.Module):
         self.act = nn.ReLU()
         self.fc1 = nn.Linear(input_dim, input_dim, bias=True)
         self.fc = nn.Linear(input_dim, num_ent, bias=True)
+        self.dropout = nn.Dropout(0.0)
 
     def forward(self, features):
-        return self.fc(self.act(self.fc1(features)))
+        return self.dropout(self.fc(self.act(self.fc1(features))))
 
 class TKGraphormer(nn.Module):
     def __init__(self, config):
@@ -54,6 +55,29 @@ class TKGraphormer(nn.Module):
         self.seq_encoder = SequenceEncoder(self.ent_dim, self.lstm_hidden_dim)
         self.decoder = InforDecoder(self.lstm_hidden_dim + self.rel_dim, self.n_ent)
 
+    # def forward(self, graph_list, query_entities, query_relations, query_timestamps, history_idx):
+    #     """
+    #     graph_list: 可见的是snapshots图，用于编码预测依据
+    #     query_entities: 需要回答的queries中的实体, [batch_size]
+    #     query_relations: 需要回答的queries中的关系
+    #     query_timestamps: 需要回答的queries中的时间戳
+    #     history_idx: [batch_size, history_len]
+    #     """
+    #     gs_h = []
+    #     for g in graph_list:
+    #         g.ndata['h'] = self.ent_embeds(g.ndata['id']).view(-1, self.ent_dim)
+    #         gs_h.append(self.graph_encoder(g)[query_entities, :])
+    #
+    #     gs_h = torch.stack(gs_h, dim=0).transpose(0, 1)   #[batch_size(query_entities), graph_num, ent_dim]
+    #     seq_ent_embeds = torch.stack([gs_h[i, history_idx[i]] for i in range(history_idx.shape[0])])  # [batch_size, history_len, ent_dim]
+    #
+    #     lstm_output = self.seq_encoder(seq_ent_embeds, query_timestamps)[:, -1, :]  # 取最后一个输出 [batch_size, lstm_hidden_dim]
+    #
+    #     query_rel_embeds = self.rel_embeds(query_relations)  # [batch_size, rel_dim]
+    #     decoder_input = torch.cat([lstm_output, query_rel_embeds], dim=-1)
+    #     output_score = self.decoder(decoder_input)  # [batch_size, num_ent]
+    #     return output_score
+
     def forward(self, graph_list, query_entities, query_relations, query_timestamps):
         """
         graph_list: 可见的是snapshots图，用于编码预测依据
@@ -70,7 +94,8 @@ class TKGraphormer(nn.Module):
         query_rel_embeds = self.rel_embeds(query_relations)  # [batch_size, rel_dim]
 
         seq_ent_embeds = torch.stack(gs_query_ent_h, dim=1)  # [batch_size, seq_len, ent_dim]
-        lstm_output = self.seq_encoder(seq_ent_embeds, query_timestamps)[:, -1, :]  # 取最后一个输出 [batch_size, lstm_hidden_dim]
+        lstm_output = self.seq_encoder(seq_ent_embeds, query_timestamps)[:, -1,
+                      :]  # 取最后一个输出 [batch_size, lstm_hidden_dim]
         decoder_input = torch.cat([lstm_output, query_rel_embeds], dim=-1)
         output_score = self.decoder(decoder_input)  # [batch_size, num_ent]
         return output_score

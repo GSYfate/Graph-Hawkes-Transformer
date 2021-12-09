@@ -2,10 +2,11 @@ import argparse
 import torch
 import os
 from tqdm import tqdm
-from dataset import BaseDataset, GraphDataset
+from dataset import *
 from model import TKGraphormer
 import logging
 from collections import namedtuple
+from torch.utils.data import DataLoader
 
 def set_logger(log_file):
     logging.basicConfig(
@@ -30,6 +31,12 @@ def parse_args(args=None):
     parser.add_argument('--data_root', type=str, default='data')
     parser.add_argument('--output_root', type=str, default='output')
     parser.add_argument('--model_name', type=str, default='baseline')
+    parser.add_argument('--batch_size', type=int, default=0)
+
+    parser.add_argument('--num_works', type=int, default=8)
+
+    parser.add_argument('--grad_norm', type=float, default=1.0)
+    parser.add_argument('--weight_decay', type=float, default=0.0001)
 
     parser.add_argument('--ent_dim', default=100, type=int)
     parser.add_argument('--rel_dim', default=100, type=int)
@@ -39,16 +46,22 @@ def parse_args(args=None):
     parser.add_argument('--lr', default=0.003, type=float)
     parser.add_argument('--do_train', action='store_true')
     parser.add_argument('--do_test', action='store_true')
-    parser.add_argument('--valid_epoch', default=30, type=int)
+    parser.add_argument('--valid_epoch', default=3, type=int)
     parser.add_argument('--history_len', default=10, type=int)
 
     return parser.parse_args(args)
 
-def test(model, test_graphdataset, skip_dict):
+def test(model, testloader, skip_dict, device):
     model.eval()
     logs = []
     with torch.no_grad():
-        for graph_list, query_entities, query_relations, query_timestamps, answers in test_graphdataset:
+        for query_entities, query_relations, answers, query_timestamps, seq_history in testloader:
+            query_entities = query_entities.to(device)
+            query_relations = query_relations.to(device)
+            answers = answers.to(device)
+            query_timestamps = query_timestamps.to(device)
+            graph_list = [g.to(device) for g in seq_history]
+
             score = model(graph_list, query_entities, query_relations, query_timestamps)
             for i in range(score.shape[0]):
                 src = query_entities[i].item()
@@ -75,15 +88,22 @@ def test(model, test_graphdataset, skip_dict):
         metrics[metric] = sum([log[metric] for log in logs]) / len(logs)
     return metrics
 
-def train_epoch(model, train_graphdataset, criterion, optimizer):
+def train_epoch(args, model, traindataloader, criterion, optimizer, device):
     model.train()
-    with tqdm(total=len(train_graphdataset), unit='ex') as bar:
+    with tqdm(total=len(traindataloader), unit='ex') as bar:
         bar.set_description('Train')
-        for idx, (graph_list, query_entities, query_relations, query_timestamps, answers) in enumerate(train_graphdataset):
+        for idx, (query_entities, query_relations, answers, query_timestamps, seq_history) in enumerate(traindataloader):
+            query_entities = query_entities.to(device)
+            query_relations = query_relations.to(device)
+            answers = answers.to(device)
+            query_timestamps = query_timestamps.to(device)
+            graph_list = [g.to(device) for g in seq_history]
+
             score = model(graph_list, query_entities, query_relations, query_timestamps)
             loss = criterion(score, answers)
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_norm)  # clip gradients
             optimizer.step()
 
             bar.update(1)
@@ -118,14 +138,58 @@ def main(args):
         time_span = 24
     else:
         time_span = 1
-    train_graphdataset = GraphDataset(baseDataset.train_snapshots, 1, baseDataset.num_e, baseDataset.num_r, args.history_len, device)
-    valid_start_idx = baseDataset.valid_snapshots[0][1] // time_span
-    valid_graphdataset = GraphDataset(baseDataset.train_snapshots + baseDataset.valid_snapshots, valid_start_idx, baseDataset.num_e,
-                                      baseDataset.num_r, args.history_len, device)
-    test_start_idx = baseDataset.test_snapshots[0][1] // time_span
-    test_graphdataset = GraphDataset(baseDataset.train_snapshots + baseDataset.valid_snapshots + baseDataset.test_snapshots,
-                                     test_start_idx, baseDataset.num_e, baseDataset.num_r,
-                                     args.history_len, device)
+    # train_graphdataset = GraphDataset(baseDataset.train_snapshots, 0, baseDataset.num_e, baseDataset.num_r, args.history_len, device)
+    # valid_start_idx = baseDataset.valid_snapshots[0][1] // time_span
+    # valid_graphdataset = GraphDataset(baseDataset.train_snapshots + baseDataset.valid_snapshots, valid_start_idx, baseDataset.num_e,
+    #                                   baseDataset.num_r, args.history_len, device)
+    # test_start_idx = baseDataset.test_snapshots[0][1] // time_span
+    # test_graphdataset = GraphDataset(baseDataset.train_snapshots + baseDataset.valid_snapshots + baseDataset.test_snapshots,
+    #                                  test_start_idx, baseDataset.num_e, baseDataset.num_r,
+    #                                  args.history_len, device)
+
+    dglGraphDataset = DGLGraphDataset(
+        baseDataset.train_snapshots + baseDataset.valid_snapshots + baseDataset.test_snapshots,
+        baseDataset.num_e, baseDataset.num_r)
+
+    trainTimes = list(range(len(baseDataset.train_snapshots)))
+    trainQuadsInputByTimeDataset = QuadsInputByTimesDataset(trainTimes, dglGraphDataset, args.history_len, args.batch_size)
+    trainDataLoader = DataLoader(
+        trainQuadsInputByTimeDataset,
+        shuffle=True,
+        batch_size=1,
+        num_workers=args.num_works,
+        collate_fn=QuadsInputByTimesDataset.collate_fn,
+    )
+
+    testTimes = list(range(len(baseDataset.train_snapshots + baseDataset.valid_snapshots),
+                           len(baseDataset.train_snapshots + baseDataset.valid_snapshots + baseDataset.test_snapshots)))
+    testQuadsInputByTimeDataset = QuadsInputByTimesDataset(testTimes, dglGraphDataset, args.history_len)
+
+    testDataLoader = DataLoader(
+        testQuadsInputByTimeDataset,
+        batch_size=1,
+        num_workers=args.num_works,
+        collate_fn=QuadsInputByTimesDataset.collate_fn,
+    )
+
+    # trainQuadruples = BaseDataset.get_reverse_quadruples_array(baseDataset.trainQuadruples, baseDataset.num_r)
+    # testQuadruples = BaseDataset.get_reverse_quadruples_array(baseDataset.testQuadruples, baseDataset.num_r)
+    # trainQuadDataset = QuadruplesDataset(trainQuadruples, args.history_len, time_span)
+    # testQuadDataset = QuadruplesDataset(testQuadruples, args.history_len, time_span)
+    # trainDataLoader = DataLoader(
+    #     trainQuadDataset,
+    #     shuffle=True,
+    #     batch_size=args.batch_size,
+    #     num_workers=8,
+    #     collate_fn=QuadruplesDataset.collate_fn,
+    # )
+    # testDataLoader = DataLoader(
+    #     testQuadDataset,
+    #     batch_size=args.batch_size,
+    #     shuffle=False,
+    #     num_workers=8,
+    #     collate_fn=QuadruplesDataset.collate_fn,
+    # )
 
     # 模型创建
     Config = namedtuple('config', ['n_ent', 'ent_dim', 'n_rel', 'rel_dim', 'lstm_hidden_dim'])
@@ -139,20 +203,20 @@ def main(args):
 
     if args.do_train:
         logging.info('Start Training......')
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=0.00001)
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         criterion = torch.nn.CrossEntropyLoss()
 
         for i in range(args.max_epochs):
-            train_epoch(model, train_graphdataset, criterion, optimizer)
+            train_epoch(args, model, trainDataLoader, criterion, optimizer, device)
 
             if i % args.valid_epoch == 0 and i != 0:
-                metrics = test(model, test_graphdataset, baseDataset.skip_dict)
+                metrics = test(model, testDataLoader, baseDataset.skip_dict, device)
                 for mode in metrics.keys():
                     logging.info('Test {} : {}'.format(mode, metrics[mode]))
 
     if args.do_test:
         logging.info('Start Testing......')
-        metrics = test(model, test_graphdataset, baseDataset.skip_dict)
+        metrics = test(model, testDataLoader, baseDataset.skip_dict, device)
         for mode in metrics.keys():
             logging.info('Test {} : {}'.format(mode, metrics[mode]))
 
