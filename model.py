@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from RGCN import RGCNLayer
+from transformer import TransformerEncoder
 
 class GraphEncoder(nn.Module):
     def __init__(self, ent_dim, num_rels, num_bases, dropout=0.0):
@@ -52,7 +53,8 @@ class TKGraphormer(nn.Module):
         self.rel_embeds = nn.Embedding(self.n_rel, self.rel_dim)
 
         self.graph_encoder = GraphEncoder(self.ent_dim, self.n_rel, self.ent_dim // 4, 0.0)
-        self.seq_encoder = SequenceEncoder(self.ent_dim, self.lstm_hidden_dim)
+        # self.seq_encoder = SequenceEncoder(self.ent_dim, self.lstm_hidden_dim)
+        self.seq_encoder = TransformerEncoder(self.ent_dim, self.ent_dim, 2, 5, self.ent_dim, self.ent_dim, 0.2)
         self.decoder = InforDecoder(self.lstm_hidden_dim + self.rel_dim, self.n_ent)
 
     # def forward(self, graph_list, query_entities, query_relations, query_timestamps, history_idx):
@@ -94,8 +96,8 @@ class TKGraphormer(nn.Module):
         query_rel_embeds = self.rel_embeds(query_relations)  # [batch_size, rel_dim]
 
         seq_ent_embeds = torch.stack(gs_query_ent_h, dim=1)  # [batch_size, seq_len, ent_dim]
-        lstm_output = self.seq_encoder(seq_ent_embeds, query_timestamps)[:, -1,
-                      :]  # 取最后一个输出 [batch_size, lstm_hidden_dim]
+        seq_times = torch.arange(0, seq_ent_embeds.shape[1], device=seq_ent_embeds.device).unsqueeze(0).repeat(seq_ent_embeds.shape[0], 1)
+        lstm_output = self.seq_encoder(seq_ent_embeds, seq_times)[:, -1, :]  # 取最后一个输出 [batch_size, lstm_hidden_dim]
         decoder_input = torch.cat([lstm_output, query_rel_embeds], dim=-1)
         output_score = self.decoder(decoder_input)  # [batch_size, num_ent]
         return output_score

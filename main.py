@@ -138,14 +138,6 @@ def main(args):
         time_span = 24
     else:
         time_span = 1
-    # train_graphdataset = GraphDataset(baseDataset.train_snapshots, 0, baseDataset.num_e, baseDataset.num_r, args.history_len, device)
-    # valid_start_idx = baseDataset.valid_snapshots[0][1] // time_span
-    # valid_graphdataset = GraphDataset(baseDataset.train_snapshots + baseDataset.valid_snapshots, valid_start_idx, baseDataset.num_e,
-    #                                   baseDataset.num_r, args.history_len, device)
-    # test_start_idx = baseDataset.test_snapshots[0][1] // time_span
-    # test_graphdataset = GraphDataset(baseDataset.train_snapshots + baseDataset.valid_snapshots + baseDataset.test_snapshots,
-    #                                  test_start_idx, baseDataset.num_e, baseDataset.num_r,
-    #                                  args.history_len, device)
 
     dglGraphDataset = DGLGraphDataset(
         baseDataset.train_snapshots + baseDataset.valid_snapshots + baseDataset.test_snapshots,
@@ -171,25 +163,6 @@ def main(args):
         num_workers=args.num_works,
         collate_fn=QuadsInputByTimesDataset.collate_fn,
     )
-
-    # trainQuadruples = BaseDataset.get_reverse_quadruples_array(baseDataset.trainQuadruples, baseDataset.num_r)
-    # testQuadruples = BaseDataset.get_reverse_quadruples_array(baseDataset.testQuadruples, baseDataset.num_r)
-    # trainQuadDataset = QuadruplesDataset(trainQuadruples, args.history_len, time_span)
-    # testQuadDataset = QuadruplesDataset(testQuadruples, args.history_len, time_span)
-    # trainDataLoader = DataLoader(
-    #     trainQuadDataset,
-    #     shuffle=True,
-    #     batch_size=args.batch_size,
-    #     num_workers=8,
-    #     collate_fn=QuadruplesDataset.collate_fn,
-    # )
-    # testDataLoader = DataLoader(
-    #     testQuadDataset,
-    #     batch_size=args.batch_size,
-    #     shuffle=False,
-    #     num_workers=8,
-    #     collate_fn=QuadruplesDataset.collate_fn,
-    # )
 
     # 模型创建
     Config = namedtuple('config', ['n_ent', 'ent_dim', 'n_rel', 'rel_dim', 'lstm_hidden_dim'])

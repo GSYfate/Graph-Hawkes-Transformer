@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 class ScaledDotProductAttention(nn.Module):
     """ Scaled Dot-Product Attention """
@@ -79,8 +80,6 @@ class MultiHeadAttention(nn.Module):
 
 
 class PositionwiseFeedForward(nn.Module):
-    """ Two-layer position-wise feed-forward neural network. """
-
     def __init__(self, d_in, d_hid, dropout=0.1, normalize_before=True):
         super().__init__()
 
@@ -108,7 +107,6 @@ class PositionwiseFeedForward(nn.Module):
         return x
 
 class EncoderLayer(nn.Module):
-    """ Compose with two layers """
     def __init__(self, d_model, d_inner, n_head, d_k, d_v, dropout=0.1, normalize_before=True):
         super(EncoderLayer, self).__init__()
         self.slf_attn = MultiHeadAttention(
@@ -116,12 +114,46 @@ class EncoderLayer(nn.Module):
         self.pos_ffn = PositionwiseFeedForward(
             d_model, d_inner, dropout=dropout, normalize_before=normalize_before)
 
-    def forward(self, enc_input, non_pad_mask=None, slf_attn_mask=None):
-        enc_output, enc_slf_attn = self.slf_attn(
-            enc_input, enc_input, enc_input, mask=slf_attn_mask)
-        enc_output *= non_pad_mask
+    def forward(self, enc_input, slf_attn_mask=None):
+        enc_output, enc_slf_attn = self.slf_attn(enc_input, enc_input, enc_input, mask=slf_attn_mask)
 
         enc_output = self.pos_ffn(enc_output)
-        enc_output *= non_pad_mask
 
         return enc_output, enc_slf_attn
+
+class TransformerEncoder(nn.Module):
+    def __init__(self, d_model, d_inner, n_layers, n_head, d_k, d_v, dropout):
+        super().__init__()
+        self.d_model = d_model
+
+        # position vector, used for temporal encoding
+        self.position_vec = torch.nn.Parameter(
+            torch.tensor([math.pow(10000.0, 2.0 * (i // 2) / d_model) for i in range(d_model)]), requires_grad=False)
+
+        self.layer_stack = nn.ModuleList([
+            EncoderLayer(d_model, d_inner, n_head, d_k, d_v, dropout=dropout, normalize_before=False)
+            for _ in range(n_layers)])
+
+    def temporal_enc(self, time):
+        result = time.unsqueeze(-1) / self.position_vec
+        result[:, :, 0::2] = torch.sin(result[:, :, 0::2])
+        result[:, :, 1::2] = torch.cos(result[:, :, 1::2])
+        return result
+
+    def forward(self, features, times):
+        """
+        features: 经过聚合后每个时间上的实体特征，[batch_size, seq_len, feature_dim(ent_dim)]
+        times: 序列对应的时间戳 [batch_size, seq_len]
+        """
+        tem_enc = self.temporal_enc(times)
+
+        for enc_layer in self.layer_stack:
+            features += tem_enc
+            features, _ = enc_layer(features)
+        return features
+
+if __name__ == '__main__':
+    model = TransformerEncoder(100, 100, 2, 5, 100, 100, 0.2)
+    features = torch.randn([2, 10, 100])
+    times = torch.tensor([list(range(10)), list(range(10))])
+    print(model(features, times).shape)
