@@ -3,6 +3,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import dgl.function as fn
 
 class RGTLayer(nn.Module):
     def __init__(self, ent_dim, rel_dim, d_hid, n_heads, dropout=0.0):
@@ -49,7 +50,7 @@ class RGTLayer(nn.Module):
         output = self.dropout(self.fc(output))  # [N, D, ent_dim]
         output += residual
         output = self.layer_norm(output)  # [N, D, ent_dim]
-        x = torch.sum(output, dim=1)  # [N, ent_dim]
+        x = torch.mean(output, dim=1)  # [N, ent_dim]
 
         residual = x
         x = F.gelu(self.w_1(x))
@@ -72,6 +73,90 @@ class RGTLayer(nn.Module):
         self.propagate(g)
         g.ndata['h'] += loop_message
         return g
+
+class RGTEncoder(nn.Module):
+    def __init__(self, ent_dim, rel_dim, dropout=0.0):
+        super(RGTEncoder, self).__init__()
+        self.layer1 = RGTLayer(ent_dim, rel_dim, ent_dim, 5, dropout)
+        self.layer2 = RGTLayer(ent_dim, rel_dim, ent_dim, 5, dropout)
+
+    def forward(self, g):
+        """g: 需要编码的snapshot图"""
+        self.layer1(g)
+        self.layer2(g)
+        return g.ndata['h']
+
+class RGCNLayer(nn.Module):
+    def __init__(self, in_feat, out_feat, num_rels, num_bases, bias=False,
+                 activation=None, self_loop=False, dropout=0.0):
+        super(RGCNLayer, self).__init__()
+        self.num_rels = num_rels    #关系数量，这里用了取反关系，r + num_r
+        self.num_bases = num_bases   # base数量，用于减少计算量
+        self.bias = bias   # 信息聚合是否有偏置
+        self.self_loop = self_loop   # 是否需要自环边
+        self.activation = activation   # 激活函数
+        self.out_feat = out_feat   # 输出特征维度
+
+        self.submat_in = in_feat // self.num_bases
+        self.submat_out = out_feat // self.num_bases
+
+        # 关系参数矩阵
+        self.weight = nn.Parameter(torch.Tensor(self.num_rels, self.num_bases * self.submat_in * self.submat_out))
+        nn.init.xavier_uniform_(self.weight, gain=nn.init.calculate_gain('relu'))
+
+        # 偏置参数
+        if self.bias:
+            self.bias_parm = nn.Parameter(torch.zeros(out_feat))
+
+        # 自环参数
+        if self.self_loop:
+            self.loop_weight = nn.Parameter(torch.Tensor(in_feat, out_feat))
+            nn.init.xavier_uniform_(self.loop_weight, gain=nn.init.calculate_gain('relu'))
+
+        self.dropout = nn.Dropout(dropout)
+
+    def msg_func(self, edges):
+        weight = self.weight.index_select(0, edges.data['type']).view(-1, self.submat_in, self.submat_out)
+        node = edges.src['h'].view(-1, 1, self.submat_in)
+        msg = torch.bmm(node, weight).view(-1, self.out_feat)
+        return {'msg': msg}
+
+    def propagate(self, g):
+        g.update_all(lambda x: self.msg_func(x), fn.sum(msg='msg', out='h'), self.apply_func)
+
+    def apply_func(self, nodes):
+        return {'h': nodes.data['h'] * nodes.data['norm']}
+
+    def forward(self, g):
+        if self.self_loop:
+            loop_message = torch.mm(g.ndata['h'], self.loop_weight)
+            loop_message = self.dropout(loop_message)
+
+        self.propagate(g)
+
+        node_repr = g.ndata['h']
+        if self.bias:
+            node_repr = node_repr + self.bias_parm
+        if self.self_loop:
+            node_repr = node_repr + loop_message
+        if self.activation:
+            node_repr = self.activation(node_repr)
+
+        g.ndata['h'] = node_repr
+        return g
+
+class RGCNEncoder(nn.Module):
+    def __init__(self, ent_dim, num_rels, num_bases, dropout=0.0):
+        """这个部分用于单个snapshot的编码"""
+        super(RGCNEncoder, self).__init__()
+        self.layer1 = RGCNLayer(ent_dim, ent_dim, num_rels, num_bases, True, torch.nn.functional.relu, True, dropout)
+        self.layer2 = RGCNLayer(ent_dim, ent_dim, num_rels, num_bases, True, None, True, dropout)
+
+    def forward(self, g):
+        """g: 需要编码的snapshot图"""
+        self.layer1(g)
+        self.layer2(g)
+        return g.ndata['h']
 
 if __name__ == '__main__':
     import numpy as np
