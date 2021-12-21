@@ -3,7 +3,7 @@ import torch
 import os
 from tqdm import tqdm
 from dataset import *
-from model import TKGraphormer
+from model import TemporalTransformerHawkesGraphModel
 import logging
 from collections import namedtuple
 from torch.utils.data import DataLoader
@@ -25,9 +25,9 @@ def parse_args(args=None):
     parser.add_argument('--grad_norm', type=float, default=1.0, help='梯度裁剪norm')
     parser.add_argument('--weight_decay', type=float, default=0.0001, help='优化器的weight decay参数')
 
-    parser.add_argument('--ent_dim', default=100, type=int, help='实体嵌入维度')
-    parser.add_argument('--rel_dim', default=100, type=int, help='关系嵌入维度')
-    parser.add_argument('--lstm_hidden_dim', default=100, type=int, help='lstm隐藏层维度')
+    parser.add_argument('--ent_dim', default=200, type=int, help='实体嵌入维度')
+    parser.add_argument('--rel_dim', default=200, type=int, help='关系嵌入维度')
+    parser.add_argument('--lstm_hidden_dim', default=200, type=int, help='lstm隐藏层维度')
     parser.add_argument('--data', default='ICEWS14', type=str, help='使用的数据集名称')
     parser.add_argument('--max_epochs', default=400, type=int, help='最大训练epoch数量')
     parser.add_argument('--lr', default=0.003, type=float, help='学习率')
@@ -57,23 +57,31 @@ def test(model, testloader, skip_dict, device):
     model.eval()
     logs = []
     with torch.no_grad():
-        for query_entities, query_relations, answers, query_timestamps, seq_history in testloader:
-            query_entities = query_entities.to(device)
-            query_relations = query_relations.to(device)
-            answers = answers.to(device)
-            query_timestamps = query_timestamps.to(device)
-            graph_list = [g.to(device) for g in seq_history]
+        total_loss = 0
+        total_num = 0
+        for sub, rel, obj, time, history_graphs, history_times, batch_node_ids in tqdm(testloader):
+            sub = sub.to(device)
+            rel = rel.to(device)
+            obj = obj.to(device)
+            time = time.to(device)
+            history_graphs = history_graphs.to(device)
+            history_times = history_times.to(device)
+            batch_node_ids = batch_node_ids.to(device)
 
-            score = model(graph_list, query_entities, query_relations, query_timestamps)
+            score = model(sub, rel, time, history_graphs, history_times, batch_node_ids)
+            loss = model.loss(score, obj)
+            total_loss += loss
+            total_num += 1
+
             for i in range(score.shape[0]):
-                src = query_entities[i].item()
-                rel = query_relations[i].item()
-                dst = answers[i].item()
-                time = query_timestamps[i].item()
+                src = sub[i].item()
+                p = rel[i].item()
+                dst = obj[i].item()
+                timestamp = time[i].item()
 
                 predict_score = score[i].tolist()
                 answer_prob = predict_score[dst]
-                for e in skip_dict[(src, rel, time)]:
+                for e in skip_dict[(src, p, timestamp)]:
                     if e != dst:
                         predict_score[e] = -1e6
                 predict_score.sort(reverse=True)
@@ -88,26 +96,10 @@ def test(model, testloader, skip_dict, device):
     metrics = {}
     for metric in logs[0].keys():
         metrics[metric] = sum([log[metric] for log in logs]) / len(logs)
+
+    logging.info('Test Loss: {}'.format(total_loss / total_num))
     return metrics
 
-def pretrain_epoch(args, model, traindataloader, optimizer, device):
-    model.train()
-    with tqdm(total=len(traindataloader), unit='ex') as bar:
-        bar.set_description('Pre Train')
-        for idx, (query_entities, query_relations, answers, query_timestamps, seq_history) in enumerate(
-                traindataloader):
-            graph_list = [g.to(device) for g in seq_history]
-            optimizer.zero_grad()
-
-            y, x = model.pre_forward(graph_list)
-            loss = model.seq_graph_loss(x, y)
-            loss.backward()
-
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_norm)  # clip gradients
-            optimizer.step()
-
-            bar.update(1)
-            bar.set_postfix(loss='%.4f' % loss)
 
 def train_epoch(args, model, traindataloader, optimizer, device, epoch):
     model.train()
@@ -115,17 +107,17 @@ def train_epoch(args, model, traindataloader, optimizer, device, epoch):
         bar.set_description('Train')
         total_loss = 0
         total_num = 0
-        for idx, (query_entities, query_relations, answers, query_timestamps, seq_history) in enumerate(traindataloader):
-            query_entities = query_entities.to(device)
-            query_relations = query_relations.to(device)
-            answers = answers.to(device)
-            query_timestamps = query_timestamps.to(device)
-            graph_list = [g.to(device) for g in seq_history]
+        for sub, rel, obj, time, history_graphs, history_times, batch_node_ids in traindataloader:
+            sub = sub.to(device)
+            rel = rel.to(device)
+            obj = obj.to(device)
+            time = time.to(device)
+            history_graphs = history_graphs.to(device)
+            history_times = history_times.to(device)
+            batch_node_ids = batch_node_ids.to(device)
 
-            optimizer.zero_grad()
-
-            score = model(graph_list, query_entities, query_relations, query_timestamps)
-            loss = model.loss(score, answers)
+            score = model(sub, rel, time, history_graphs, history_times, batch_node_ids)
+            loss = model.loss(score, obj)
 
             loss.backward()
 
@@ -172,25 +164,25 @@ def main(args):
         baseDataset.train_snapshots + baseDataset.valid_snapshots + baseDataset.test_snapshots,
         baseDataset.num_e, baseDataset.num_r)
 
-    trainTimes = list(range(len(baseDataset.train_snapshots)))
-    trainQuadsInputByTimeDataset = QuadsInputByTimesDataset(trainTimes, dglGraphDataset, args.history_len, args.batch_size)
+    trainQuadruples = baseDataset.get_reverse_quadruples_array(baseDataset.trainQuadruples, baseDataset.num_r)
+    trainQuadDataset = QuadruplesDataset(trainQuadruples, args.history_len, dglGraphDataset,
+                                         baseDataset.time_inverted_index_dict, 'both', 1)
     trainDataLoader = DataLoader(
-        trainQuadsInputByTimeDataset,
+        trainQuadDataset,
         shuffle=True,
-        batch_size=1,
+        batch_size=args.batch_size,
+        collate_fn=trainQuadDataset.collate_fn,
         num_workers=args.num_works,
-        collate_fn=QuadsInputByTimesDataset.collate_fn,
     )
 
-    testTimes = list(range(len(baseDataset.train_snapshots + baseDataset.valid_snapshots),
-                           len(baseDataset.train_snapshots + baseDataset.valid_snapshots + baseDataset.test_snapshots)))
-    testQuadsInputByTimeDataset = QuadsInputByTimesDataset(testTimes, dglGraphDataset, args.history_len)
-
+    testQuadruples = baseDataset.get_reverse_quadruples_array(baseDataset.testQuadruples, baseDataset.num_r)
+    testQuadDataset = QuadruplesDataset(testQuadruples, args.history_len, dglGraphDataset,
+                                         baseDataset.time_inverted_index_dict, 'both', 1)
     testDataLoader = DataLoader(
-        testQuadsInputByTimeDataset,
-        batch_size=1,
+        testQuadDataset,
+        batch_size=args.batch_size,
+        collate_fn=testQuadDataset.collate_fn,
         num_workers=args.num_works,
-        collate_fn=QuadsInputByTimesDataset.collate_fn,
     )
 
     # 模型创建
@@ -206,30 +198,15 @@ def main(args):
                     decoder=args.decoder,
                     seqTransformerLayerNum=args.seqTransformerLayerNum,
                     seqTransformerHeadNum=args.seqTransformerHeadNum)
-    model = TKGraphormer(config)
+    model = TemporalTransformerHawkesGraphModel(config)
     model.to(device)
 
     if args.do_train:
         logging.info('Start Training......')
-        # optimizer = ScheduledOptim(
-        #     torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay),
-        #     2.0,
-        #     args.ent_dim,
-        #     args.warmup_step,
-        # )
-        preOptimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-
-        # optimizer = torch.optim.SGD(model.parameters(), lr=args.lr)
-        # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1.0, gamma=0.95)
-        # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1, gamma=0.5)
-
-        # for i in range(5):
-        #     pretrain_epoch(args, model, trainDataLoader, preOptimizer, device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=0.00001)
 
         for i in range(args.max_epochs):
             train_epoch(args, model, trainDataLoader, optimizer, device, i)
-            # scheduler.step()
             if i % args.valid_epoch == 0 and i != 0:
                 metrics = test(model, testDataLoader, baseDataset.skip_dict, device)
                 for mode in metrics.keys():

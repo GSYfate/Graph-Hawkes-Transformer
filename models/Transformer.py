@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import numpy as np
 
 class ScaledDotProductAttention(nn.Module):
     """ Scaled Dot-Product Attention """
@@ -10,8 +11,10 @@ class ScaledDotProductAttention(nn.Module):
         self.temperature = temperature
         self.dropout = nn.Dropout(attn_dropout)
 
-    def forward(self, q, k, v, mask=None):
-        attn = torch.matmul(q / self.temperature, k.transpose(2, 3))
+    def forward(self, q, k, v, att_bias=None, mask=None):
+        attn = torch.matmul(q / self.temperature, k.transpose(2, 3))   # [batch_size, n_head, seq_len, seq_len]
+        if att_bias is not None:
+            attn = attn + att_bias
 
         if mask is not None:
             attn = attn.masked_fill(mask, -1e9)
@@ -46,7 +49,7 @@ class MultiHeadAttention(nn.Module):
         self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, q, k, v, mask=None):
+    def forward(self, q, k, v, att_bias=None, mask=None):
         d_k, d_v, n_head = self.d_k, self.d_v, self.n_head
         sz_b, len_q, len_k, len_v = q.size(0), q.size(1), k.size(1), v.size(1)
 
@@ -66,7 +69,7 @@ class MultiHeadAttention(nn.Module):
         if mask is not None:
             mask = mask.unsqueeze(1)  # For head axis broadcasting.
 
-        output, attn = self.attention(q, k, v, mask=mask)
+        output, attn = self.attention(q, k, v, att_bias=att_bias, mask=mask)
 
         # Transpose to move the head dimension back: b x lq x n x dv
         # Combine the last two dimensions to concatenate all the heads together: b x lq x (n*dv)
@@ -106,6 +109,10 @@ class PositionwiseFeedForward(nn.Module):
             x = self.layer_norm(x)
         return x
 
+def generate_square_subsequent_mask(sz: int):
+    """Generates an upper-triangular matrix of -inf, with zeros on diag."""
+    return torch.triu(torch.ones(sz, sz) * float('-inf'), diagonal=1)
+
 class EncoderLayer(nn.Module):
     def __init__(self, d_model, d_inner, n_head, d_k, d_v, dropout=0.1, normalize_before=True):
         super(EncoderLayer, self).__init__()
@@ -114,8 +121,8 @@ class EncoderLayer(nn.Module):
         self.pos_ffn = PositionwiseFeedForward(
             d_model, d_inner, dropout=dropout, normalize_before=normalize_before)
 
-    def forward(self, enc_input, slf_attn_mask=None):
-        enc_output, enc_slf_attn = self.slf_attn(enc_input, enc_input, enc_input, mask=slf_attn_mask)
+    def forward(self, enc_input,  att_bias=None, slf_attn_mask=None):
+        enc_output, enc_slf_attn = self.slf_attn(enc_input, enc_input, enc_input, att_bias=att_bias, mask=slf_attn_mask)
 
         enc_output = self.pos_ffn(enc_output)
 
