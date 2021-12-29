@@ -45,8 +45,9 @@ def parse_args(args=None):
     parser.add_argument('--warmup_step', default=200, type=int, help='Warmup 参数')
     parser.add_argument('--load_model_path', default='output', type=str, help='加载模型')
     parser.add_argument('--dropout', default=0.2, type=float)
-    parser.add_argument('--history_mode', default='recent', type=str)
+    parser.add_argument('--history_mode', default='delta_t_windows', type=str)
     parser.add_argument('--nhop', default=1, type=int)
+    parser.add_argument('--forecasting_t_win_size', default=1, type=int)
 
     return parser.parse_args(args)
 
@@ -178,7 +179,8 @@ def main(args):
     TITerhistory = pickle.load(open('ICEWS14_Sampled_history.pkl', 'rb'))
     trainQuadruples = baseDataset.get_reverse_quadruples_array(baseDataset.trainQuadruples, baseDataset.num_r)
     trainQuadDataset = QuadruplesDataset(trainQuadruples, args.history_len, dglGraphDataset,
-                                         baseDataset, args.history_mode, args.nhop, TITerhistory)
+                                         baseDataset, args.history_mode, args.nhop, TITerhistory, args.forecasting_t_win_size,
+                                         time_span)
     trainDataLoader = DataLoader(
         trainQuadDataset,
         shuffle=True,

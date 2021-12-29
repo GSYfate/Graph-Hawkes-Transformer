@@ -108,6 +108,7 @@ class TemporalTransformerHawkesGraphModel(nn.Module):
     def predict(self, query_entities, query_relations, query_timestamps, history_graphs, history_times, batch_node_ids):
         intens, type = self.forward(query_entities, query_relations, query_timestamps, history_graphs, history_times, batch_node_ids)
         # intens[:, :self.n_ent] = 0
-        output = torch_scatter.scatter(intens, type, dim=-1, reduce="max")
+        output = torch_scatter.scatter(intens, type, dim=-1, reduce="max")  # Link Prediction 得分
+
         return output[:, :-1]
 

@@ -194,22 +194,12 @@ class DGLGraphDataset(object):
                 neighbor_n = set(neighbor_n.tolist())
                 total_nodes |= neighbor_n
         sub_g = g.subgraph(list(total_nodes), store_ids=False)
-
-        # choice = [True, False]
-        # choice_false = np.random.random() * edge_drop_rate
-        # choice_pre = [1 - choice_false, choice_false]
-        # choice_array = np.random.choice(choice, size=sub_g.num_edges(), replace=True, p=choice_pre)
-        # sub_g = dgl.edge_subgraph(sub_g, torch.tensor(choice_array))
-        #
-        # if root_node in sub_g.ndata['id'].squeeze(1).tolist():
-        #     return sub_g
-        # else:
-        #     return g.subgraph([root_node])
         return sub_g
 
 
 class QuadruplesDataset(Dataset):
-    def __init__(self, quadruples, history_len, dglGraphs, baseDataset, history_mode='recent', nhop=2, TITerHistory=None):
+    def __init__(self, quadruples, history_len, dglGraphs, baseDataset, history_mode='recent', nhop=2, TITerHistory=None,
+                 forecasting_t_windows_size=1, time_span=24):
         self.quadruples = quadruples  # 四元组数组，np.array, [quad_num, 4] (sub, rel, obj, time)
         self.history_len = history_len  # 预测答案依据的最大历史序列长度
         self.dglGraphs = dglGraphs  # DGLGraphDataset类
@@ -219,20 +209,23 @@ class QuadruplesDataset(Dataset):
         self.PAD_TIME = -1
         self.num_r = baseDataset.num_r
         self.TITerHistory = TITerHistory  # 储存的一步路径，按照TITer得分从高到低
+        self.forecasting_t_windows_size = forecasting_t_windows_size  # 用于预测的时间窗口
+        self.time_span = time_span
 
     def __len__(self):
-        return len(self.quadruples)
+        return len(self.quadruples) * self.forecasting_t_windows_size
 
     def __getitem__(self, idx):
-        quad = self.quadruples[idx]
+        quad_idx = idx // self.forecasting_t_windows_size
+        delta_t = idx % self.forecasting_t_windows_size + 1
+        quad = self.quadruples[quad_idx]
         head_entity, relation, tail_entity, timestamp = quad[0], quad[1], quad[2], quad[3]
         history_graphs, history_times, head_entity_ids, graphs_node_num = \
-            self.get_history_graphs(head_entity, relation, timestamp, self.history_mode)
-
+            self.get_history_graphs(head_entity, relation, timestamp, self.history_mode, delta_t)
         return head_entity, relation, tail_entity, timestamp, \
               history_graphs, history_times, head_entity_ids, graphs_node_num
 
-    def get_history_graphs(self, head_entity, relation, timestamp, sampled_method='recent'):
+    def get_history_graphs(self, head_entity, relation, timestamp, sampled_method='recent', delta_t=1):
         if sampled_method == 'titer':
             return self.get_history_graphs_from_titer(head_entity, relation, timestamp)
         elif sampled_method == 'history_copy':
@@ -245,6 +238,16 @@ class QuadruplesDataset(Dataset):
             history_times1 = times1[:times1.index(timestamp)]
             history_times1 = history_times1[max(-(self.history_len // 2), -len(history_times1)):]
             history_times2 = times2[:times2.index(timestamp)]
+            history_times2 = history_times2[max(-(self.history_len // 2), -len(history_times2)):]
+            history_times = sorted(list(set(history_times1 + history_times2)))
+        elif sampled_method == 'delta_t_windows':
+            times1 = self.timeInvDict[(head_entity, relation)]
+            times2 = self.timeInvDict[head_entity]
+            history_times1 = times1[:times1.index(timestamp)]
+            history_times1 = list(filter(lambda x: timestamp - x > delta_t * self.time_span, history_times1))
+            history_times1 = history_times1[max(-(self.history_len // 2), -len(history_times1)):]
+            history_times2 = times2[:times2.index(timestamp)]
+            history_times2 = list(filter(lambda x: timestamp - x > delta_t * self.time_span, history_times2))
             history_times2 = history_times2[max(-(self.history_len // 2), -len(history_times2)):]
             history_times = sorted(list(set(history_times1 + history_times2)))
         else:
