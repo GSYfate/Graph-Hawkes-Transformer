@@ -101,7 +101,7 @@ class TempMultiHeadAttention(nn.Module):
         k_time_cos, k_time_sin = self.time_encoding(k_time)
 
         q_time_cos, q_time_sin = qtw * q_time_cos.unsqueeze(1), qtw * q_time_sin.unsqueeze(1)
-        k_time_cos, k_time_sin = qtw * k_time_cos.unsqueeze(1), qtw * k_time_sin.unsqueeze(1)
+        k_time_cos, k_time_sin = k_time_cos.unsqueeze(1), k_time_sin.unsqueeze(1)
 
         q = torch.cat([q, q_time_cos, q_time_sin], dim=-1)
         k = torch.cat([k, k_time_cos, k_time_sin], dim=-1)

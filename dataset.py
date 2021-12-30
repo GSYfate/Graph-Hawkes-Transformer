@@ -161,21 +161,12 @@ class DGLGraphDataset(object):
         g = dgl.DGLGraph()
         g.add_nodes(num_nodes)
         g.add_edges(src, dst)
-        # norm = self.comp_deg_norm(g)
+
         node_id = torch.arange(0, num_nodes, dtype=torch.long).view(-1, 1)
         g.ndata.update({'id': node_id})
-        # g.ndata.update({'id': node_id, 'norm': norm.view(-1, 1)})
-        # g.apply_edges(lambda edges: {'norm': edges.dst['norm'] * edges.src['norm']})
         g.edata['type'] = torch.LongTensor(rel)
         g.edata['timestamp'] = torch.LongTensor(torch.ones_like(g.edata['type']) * time)
         return g
-
-    def comp_deg_norm(self, g):
-        # 计算图中节点的度正则项
-        in_deg = g.in_degrees(range(g.number_of_nodes())).float()
-        in_deg[torch.nonzero(in_deg == 0).view(-1)] = 1
-        norm = 1.0 / in_deg
-        return norm
 
     def get_nhop_subgraph(self, time, root_node, n=2):
         """获取某组节点在某个时间的n步邻居子图
@@ -183,7 +174,7 @@ class DGLGraphDataset(object):
         node: 节点id
         n: N步邻居
         """
-        g = self.dgl_graph_dict[time]  # time时刻的图
+        g = self.dgl_graph_dict[time]   # time时刻的图
         g = dgl.in_subgraph(g, [root_node])
         total_nodes = set()
         total_nodes.add(root_node)
@@ -198,7 +189,7 @@ class DGLGraphDataset(object):
 
 
 class QuadruplesDataset(Dataset):
-    def __init__(self, quadruples, history_len, dglGraphs, baseDataset, history_mode='recent', nhop=2, TITerHistory=None,
+    def __init__(self, quadruples, history_len, dglGraphs, baseDataset, history_mode='recent', nhop=2,
                  forecasting_t_windows_size=1, time_span=24):
         self.quadruples = quadruples  # 四元组数组，np.array, [quad_num, 4] (sub, rel, obj, time)
         self.history_len = history_len  # 预测答案依据的最大历史序列长度
@@ -208,7 +199,6 @@ class QuadruplesDataset(Dataset):
         self.history_mode = history_mode
         self.PAD_TIME = -1
         self.num_r = baseDataset.num_r
-        self.TITerHistory = TITerHistory  # 储存的一步路径，按照TITer得分从高到低
         self.forecasting_t_windows_size = forecasting_t_windows_size  # 用于预测的时间窗口
         self.time_span = time_span
 
@@ -226,9 +216,7 @@ class QuadruplesDataset(Dataset):
               history_graphs, history_times, head_entity_ids, graphs_node_num
 
     def get_history_graphs(self, head_entity, relation, timestamp, sampled_method='recent', delta_t=1):
-        if sampled_method == 'titer':
-            return self.get_history_graphs_from_titer(head_entity, relation, timestamp)
-        elif sampled_method == 'history_copy':
+        if sampled_method == 'history_copy':
             times = self.timeInvDict[(head_entity, relation)]
             history_times = times[:times.index(timestamp)]
             history_times = history_times[max(-self.history_len, -len(history_times)):]
@@ -249,7 +237,8 @@ class QuadruplesDataset(Dataset):
             history_times2 = times2[:times2.index(timestamp)]
             history_times2 = list(filter(lambda x: timestamp - x > delta_t * self.time_span, history_times2))
             history_times2 = history_times2[max(-(self.history_len // 2), -len(history_times2)):]
-            history_times = sorted(list(set(history_times1 + history_times2)))
+            last_time = [max([timestamp - self.time_span * delta_t, -1])]
+            history_times = sorted(list(set(history_times1 + history_times2 + last_time)))
         else:
             # 取发生在head_entity上最近的N个图
             times = self.timeInvDict[head_entity]
@@ -263,8 +252,8 @@ class QuadruplesDataset(Dataset):
             # 取head_entity的nhop邻居子图
             sub_graph = self.dglGraphs.get_nhop_subgraph(t, head_entity, self.nhop)
             # 如果sampled后的子图没有边，则设置成PAD TIME用于
-            if sub_graph.num_edges() < 1:
-                history_times[i] = self.PAD_TIME
+            # if sub_graph.num_edges() < 1:
+            #     history_times[i] = self.PAD_TIME
 
             sub_graph.edata['query_rel'] = torch.ones_like(sub_graph.edata['type']) * relation
             sub_graph.edata['query_ent'] = torch.ones_like(sub_graph.edata['type']) * head_entity
@@ -275,52 +264,6 @@ class QuadruplesDataset(Dataset):
 
         # 返回历史图list, 历史图时间戳list 头实体在graph中的node id list, graph对应的节点数量
         return history_graphs, history_times, head_entity_ids, graphs_node_num
-
-    def get_history_graphs_from_titer(self, query_sub, query_rel, query_time):
-
-        histories = self.TITerHistory[(query_sub, query_rel, query_time)]
-        hist_graphs = defaultdict(list)
-        for path in histories:
-            if len(hist_graphs) >= self.history_len:
-                break
-            out_rel, out_ent, out_time = path[0], path[1], path[2]
-            if out_rel == self.num_r * 2 + 1:
-                continue
-            if out_rel > self.num_r:
-                out_rel = out_rel - 1
-                hist_graphs[out_time].append([query_sub, out_rel, out_ent])
-                hist_graphs[out_time].append([out_ent, out_rel - self.num_r, query_sub])
-            elif out_rel == self.num_r:
-                continue
-            else:
-                hist_graphs[out_time].append([query_sub, out_rel, out_ent])
-                hist_graphs[out_time].append([out_ent, out_rel + self.num_r, query_sub])
-
-        hist_dgl_graphs = []
-        hist_times = []
-        node_ids = []
-        times = sorted(list(hist_graphs.keys()))
-        graphs_node_num = []
-        for time in times:
-            src, rel, dst = np.array(hist_graphs[time]).transpose()
-            uniq_v, edges = np.unique((src, dst), return_inverse=True)
-            src, dst = np.reshape(edges, (2, -1))
-            g = dgl.DGLGraph()
-            g.add_nodes(len(uniq_v))
-            g.add_edges(src, dst)
-            g.ndata.update({'id': torch.from_numpy(uniq_v).long().view(-1, 1)})
-            g.edata['type'] = torch.LongTensor(rel)
-
-            g.edata['query_rel'] = torch.ones_like(g.edata['type']) * query_rel
-            g.edata['query_ent'] = torch.ones_like(g.edata['type']) * query_sub
-            g.edata['query_time'] = torch.ones_like(g.edata['type']) * query_time
-
-            hist_dgl_graphs.append(g)
-            hist_times.append(time)
-            node_ids.append(g.ndata['id'].squeeze(1).tolist().index(query_sub))
-            graphs_node_num.append(g.num_nodes())
-
-        return hist_dgl_graphs, hist_times, node_ids, graphs_node_num
 
     @staticmethod
     def collate_fn(batch, pad_entity):
@@ -394,197 +337,3 @@ class QuadruplesDataset(Dataset):
         pad_history_times = torch.tensor(pad_history_times)  # [bs, history_len]
 
         return head_entites, relations, tail_entities, timestamps, pad_history_graphs, pad_history_times, batch_node_ids
-
-
-class QuadsInputByTimesDataset(Dataset):
-    def __init__(self, timeIDs, dglDataset, seq_len, num_sample_triples=0):
-        self.timeIDs = timeIDs  # 用于训练的时间戳ID
-        self.dglDataset = dglDataset
-        self.snapshots = [(self.get_reverse_triples(self.dglDataset.n_rel, g), t) for g, t in self.dglDataset.snapshots]
-        self.seq_len = seq_len
-        self.num_sample_triples = num_sample_triples
-
-    def __len__(self):
-        return len(self.timeIDs)
-
-    def __getitem__(self, idx):
-        timeid = self.timeIDs[idx]
-        predict_triples, predict_t = self.snapshots[timeid]
-        seq_graphs = [self.dglDataset.dgl_graphs[max(0, timeid-self.seq_len+1+i)] for i in range(self.seq_len)]
-        if self.num_sample_triples:
-            predict_triples = self.triples_sample(predict_triples)
-        predict_s = torch.tensor(predict_triples[:, 0])
-        predict_p = torch.tensor(predict_triples[:, 1])
-        predict_o = torch.tensor(predict_triples[:, 2])
-        predict_t = torch.ones_like(predict_s) * predict_t
-        return predict_s, predict_p, predict_o, predict_t, seq_graphs
-
-    def get_reverse_triples(self, num_r, triples):
-        triples_r = np.zeros_like(triples)
-        triples_r[:, 1] = num_r + triples[:, 1]
-        triples_r[:, 0] = triples[:, 2]
-        triples_r[:, 2] = triples[:, 0]
-        return np.concatenate((triples, triples_r))
-
-    def triples_sample(self, triples):
-        # 对三元组采样
-        if self.num_sample_triples < len(triples):
-            index = np.random.choice(range(len(triples)), self.num_sample_triples, False)
-            triples = triples[index]
-        return triples
-
-    @staticmethod
-    def collate_fn(data):
-        predict_s, predict_p, predict_o, predict_t, seq_graphs = data[0]
-        return predict_s, predict_p, predict_o, predict_t, seq_graphs
-
-
-class QuadruplesTITerHistoryDataset(Dataset):
-    def __init__(self, quadruples, titerhistory, baseDataset, history_max=3, mode=0):
-        self.quadruples = quadruples  # 四元组数组，np.array, [quad_num, 4] (sub, rel, obj, time)
-        self.TITerHistory = titerhistory
-        self.num_r = baseDataset.num_r
-        self.mode = mode
-        self.history_max = history_max
-
-    def __len__(self):
-        return len(self.quadruples)
-
-    def __getitem__(self, idx):
-        quad = self.quadruples[idx]
-        sub, rel, obj, time = quad[0], quad[1], quad[2], quad[3]
-        if self.mode == 1:
-            history_graphs, history_times, node_ids = self.get_graph_list(sub, rel, time)
-        else:
-            history_graphs, history_times, node_ids = self.TITerHistory[(sub, rel, time)]
-        return torch.tensor(sub), torch.tensor(rel), torch.tensor(obj), torch.tensor(time), \
-               history_graphs, history_times, node_ids
-
-    @staticmethod
-    def collate_fn(data):
-        sub = torch.stack([_[0] for _ in data], dim=0)
-        rel = torch.stack([_[1] for _ in data], dim=0)
-        obj = torch.stack([_[2] for _ in data], dim=0)
-        time = torch.stack([_[3] for _ in data], dim=0)
-
-        max_history_len = max([len(_[4]) for _ in data])
-        max_history_len = max([max_history_len, 1])
-
-        history_graphs = []
-        history_times = []
-        node_ids = []
-
-        for item in data:
-            gs = item[4]
-            ht = item[5]
-            ni = item[6]
-            g = dgl.DGLGraph()
-            g.add_nodes(1)
-            g.ndata.update({'id': item[0].view(-1, 1)})
-            g.edata['type'] = torch.LongTensor(np.array([]))
-            g.edata['query_rel'] = torch.ones_like(g.edata['type'])
-            g.edata['query_ent'] = torch.ones_like(g.edata['type'])
-            g.edata['query_time'] = torch.ones_like(g.edata['type'])
-            extend_g = [g.__copy__() for i in range(max_history_len - len(gs))]
-            extend_ht = [-1 for i in range(max_history_len - len(gs))]
-            extend_ni = [0 for i in range(max_history_len - len(gs))]
-            gs = extend_g + gs
-            ht = extend_ht + ht
-            ni = extend_ni + ni
-            history_graphs.extend(gs)
-            history_times.append(ht)
-            node_ids.extend(ni)
-
-        history_graphs = dgl.batch(history_graphs)
-        history_times = torch.tensor(history_times)
-        batch_node_ids = torch.tensor(node_ids)
-        batchgraph_nodes_num = history_graphs.batch_num_nodes()
-        graph_num = batchgraph_nodes_num.size(0)
-        offset_node_ids = batchgraph_nodes_num.unsqueeze(0).repeat(graph_num, 1)
-        offset_mask = torch.tril(torch.ones(graph_num, graph_num), diagonal=-1).long()
-        offset_node_ids = offset_node_ids * offset_mask
-        offset_node_ids = torch.sum(offset_node_ids, dim=1)
-        batch_node_ids += offset_node_ids
-
-        return sub, rel, obj, time, history_graphs, history_times, batch_node_ids
-
-    def get_graph_list(self, query_sub, query_rel, query_time):
-        histories = self.TITerHistory[(query_sub, query_rel, query_time)]
-        hist_graphs = defaultdict(list)
-        for path in histories:
-            if len(hist_graphs) >= self.history_max:
-                break
-            out_rel, out_ent, out_time = path[0], path[1], path[2]
-            if out_rel == self.num_r * 2 + 1:
-                continue
-            if out_rel > self.num_r:
-                out_rel = out_rel - 1
-                hist_graphs[out_time].append([query_sub, out_rel, out_ent])
-                hist_graphs[out_time].append([out_ent, out_rel - self.num_r, query_sub])
-            elif out_rel == self.num_r:
-                continue
-            else:
-                hist_graphs[out_time].append([query_sub, out_rel, out_ent])
-                hist_graphs[out_time].append([out_ent, out_rel + self.num_r, query_sub])
-
-        hist_dgl_graphs = []
-        hist_times = []
-        node_ids = []
-        times = sorted(list(hist_graphs.keys()))
-        for time in times:
-            src, rel, dst = np.array(hist_graphs[time]).transpose()
-            uniq_v, edges = np.unique((src, dst), return_inverse=True)
-            src, dst = np.reshape(edges, (2, -1))
-            g = dgl.DGLGraph()
-            g.add_nodes(len(uniq_v))
-            g.add_edges(src, dst)
-            g.ndata.update({'id': torch.from_numpy(uniq_v).long().view(-1, 1)})
-            g.edata['type'] = torch.LongTensor(rel)
-
-            g.edata['query_rel'] = torch.ones_like(g.edata['type']) * query_rel
-            g.edata['query_ent'] = torch.ones_like(g.edata['type']) * query_sub
-            g.edata['query_time'] = torch.ones_like(g.edata['type']) * query_time
-
-            hist_dgl_graphs.append(g)
-            hist_times.append(time)
-            node_ids.append(g.ndata['id'].squeeze(1).tolist().index(query_sub))
-
-        return hist_dgl_graphs, hist_times, node_ids
-
-
-if __name__ == '__main__':
-    ####  基本数据处理测试
-    data = 'data/ICEWS14'
-    trainpath = os.path.join(data, 'train.txt')
-    validpath = os.path.join(data, 'valid.txt')
-    testpath = os.path.join(data, 'test.txt')
-    statpath = os.path.join(data, 'stat.txt')
-    baseDataset = BaseDataset(trainpath, testpath, statpath, validpath)
-
-    dglGraphDataset = DGLGraphDataset(
-        baseDataset.train_snapshots + baseDataset.valid_snapshots + baseDataset.test_snapshots,
-        baseDataset.num_e, baseDataset.num_r)
-
-    trainQuadruples = baseDataset.get_reverse_quadruples_array(baseDataset.trainQuadruples, baseDataset.num_r)
-    trainDataset = QuadruplesDataset(trainQuadruples, 3, dglGraphDataset, baseDataset)
-    trainDataLoader = DataLoader(
-        trainDataset,
-        shuffle=True,
-        batch_size=2,
-        collate_fn=lambda x: trainDataset.collate_fn(x, baseDataset.num_e),
-    )
-
-    for sub, rel, obj, time, history_graphs, history_times, batch_node_ids in trainDataLoader:
-        print(sub)
-        print(rel)
-        print(obj)
-        print(time)
-        print(history_graphs.ndata['id'][batch_node_ids])
-        print(history_times)
-
-        src, dst = history_graphs.edges()
-        edge_type = history_graphs.edata['type']
-        nid = history_graphs.ndata['id']
-        for i in range(src.shape[0]):
-            print(nid[src[i]].item(), edge_type[i].item(), nid[dst[i]].item())
-
