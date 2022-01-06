@@ -175,7 +175,7 @@ class DGLGraphDataset(object):
         n: N步邻居
         """
         g = self.dgl_graph_dict[time]   # time时刻的图
-        g = dgl.in_subgraph(g, [root_node])
+        # g = dgl.in_subgraph(g, [root_node])
         total_nodes = set()
         total_nodes.add(root_node)
         for i in range(n):
@@ -185,12 +185,36 @@ class DGLGraphDataset(object):
                 neighbor_n = set(neighbor_n.tolist())
                 total_nodes |= neighbor_n
         sub_g = g.subgraph(list(total_nodes), store_ids=False)
+        # sub_g.ndata['norm'] = self.comp_deg_norm(sub_g).view(-1, 1)
+        # sub_g.apply_edges(lambda edges: {'norm': edges.dst['norm'] * edges.src['norm']})
         return sub_g
+
+    def edge_samples(self, root_node, sub_g, conf):
+        if sub_g.num_edges() <= 1:
+            return sub_g
+        edge_type = sub_g.edata['type']
+        edge_conf = conf[edge_type]
+        chosen = edge_conf > 0.1
+        sub_g = dgl.edge_subgraph(sub_g, chosen, store_ids=False)
+        if root_node in sub_g.ndata['id'].squeeze(1).tolist():
+            return sub_g
+        else:
+            g = dgl.DGLGraph()
+            g.add_nodes(1, {'id': torch.tensor([root_node]).view(-1, 1)})
+            g.edata['type'] = torch.LongTensor(np.array([]))
+            return g
+
+    def comp_deg_norm(self, g):
+        # 计算图中节点的度正则项
+        in_deg = g.in_degrees(range(g.number_of_nodes())).float()
+        in_deg[torch.nonzero(in_deg == 0).view(-1)] = 1
+        norm = 1.0 / in_deg
+        return norm
 
 
 class QuadruplesDataset(Dataset):
     def __init__(self, quadruples, history_len, dglGraphs, baseDataset, history_mode='recent', nhop=2,
-                 forecasting_t_windows_size=1, time_span=24):
+                 forecasting_t_windows_size=1, time_span=24, edges_conf=None, edge_sample=False, dataset_type='train'):
         self.quadruples = quadruples  # 四元组数组，np.array, [quad_num, 4] (sub, rel, obj, time)
         self.history_len = history_len  # 预测答案依据的最大历史序列长度
         self.dglGraphs = dglGraphs  # DGLGraphDataset类
@@ -201,19 +225,34 @@ class QuadruplesDataset(Dataset):
         self.num_r = baseDataset.num_r
         self.forecasting_t_windows_size = forecasting_t_windows_size  # 用于预测的时间窗口
         self.time_span = time_span
+        self.edges_conf = edges_conf
+        self.edge_sample = edge_sample
+        self.dataset_type = dataset_type
+        self.delta_t = 1
 
     def __len__(self):
-        return len(self.quadruples) * self.forecasting_t_windows_size
+        if self.dataset_type == 'train':
+            return len(self.quadruples) * self.forecasting_t_windows_size
+        else:
+            return len(self.quadruples)
 
     def __getitem__(self, idx):
-        quad_idx = idx // self.forecasting_t_windows_size
-        delta_t = idx % self.forecasting_t_windows_size + 1
-        quad = self.quadruples[quad_idx]
-        head_entity, relation, tail_entity, timestamp = quad[0], quad[1], quad[2], quad[3]
-        history_graphs, history_times, head_entity_ids, graphs_node_num = \
-            self.get_history_graphs(head_entity, relation, timestamp, self.history_mode, delta_t)
-        return head_entity, relation, tail_entity, timestamp, \
-              history_graphs, history_times, head_entity_ids, graphs_node_num
+        if self.dataset_type == 'train':
+            quad_idx = idx // self.forecasting_t_windows_size
+            delta_t = idx % self.forecasting_t_windows_size + 1
+            quad = self.quadruples[quad_idx]
+            head_entity, relation, tail_entity, timestamp = quad[0], quad[1], quad[2], quad[3]
+            history_graphs, history_times, head_entity_ids, graphs_node_num = \
+                self.get_history_graphs(head_entity, relation, timestamp, self.history_mode, delta_t)
+            return head_entity, relation, tail_entity, timestamp, \
+                  history_graphs, history_times, head_entity_ids, graphs_node_num
+        else:
+            quad = self.quadruples[idx]
+            head_entity, relation, tail_entity, timestamp = quad[0], quad[1], quad[2], quad[3]
+            history_graphs, history_times, head_entity_ids, graphs_node_num = \
+                self.get_history_graphs(head_entity, relation, timestamp, self.history_mode, self.delta_t)
+            return head_entity, relation, tail_entity, timestamp, \
+                   history_graphs, history_times, head_entity_ids, graphs_node_num
 
     def get_history_graphs(self, head_entity, relation, timestamp, sampled_method='recent', delta_t=1):
         if sampled_method == 'history_copy':
@@ -251,13 +290,17 @@ class QuadruplesDataset(Dataset):
         for i, t in enumerate(history_times):
             # 取head_entity的nhop邻居子图
             sub_graph = self.dglGraphs.get_nhop_subgraph(t, head_entity, self.nhop)
+
+            if self.edge_sample:
+                sub_graph = self.dglGraphs.edge_samples(head_entity, sub_graph, self.edges_conf[relation])
+
             # 如果sampled后的子图没有边，则设置成PAD TIME用于
             # if sub_graph.num_edges() < 1:
             #     history_times[i] = self.PAD_TIME
 
             sub_graph.edata['query_rel'] = torch.ones_like(sub_graph.edata['type']) * relation
             sub_graph.edata['query_ent'] = torch.ones_like(sub_graph.edata['type']) * head_entity
-            sub_graph.edata['query_time'] = torch.ones_like(sub_graph.edata['type']) * timestamp
+            # sub_graph.edata['query_time'] = torch.ones_like(sub_graph.edata['type']) * timestamp
             history_graphs.append(sub_graph)
             head_entity_ids.append(sub_graph.ndata['id'].squeeze(1).tolist().index(head_entity))
             graphs_node_num.append(sub_graph.num_nodes())
@@ -298,7 +341,13 @@ class QuadruplesDataset(Dataset):
                     g.edata['type'] = torch.LongTensor(np.array([]))
                     g.edata['query_rel'] = torch.ones_like(g.edata['type'])
                     g.edata['query_ent'] = torch.ones_like(g.edata['type'])
-                    g.edata['query_time'] = torch.ones_like(g.edata['type'])
+                    # g.edata['query_time'] = torch.ones_like(g.edata['type'])
+
+                    # in_deg = g.in_degrees(range(g.number_of_nodes())).float()
+                    # in_deg[torch.nonzero(in_deg == 0).view(-1)] = 1
+                    # norm = 1.0 / in_deg
+                    # g.ndata['norm'] = norm.view(-1, 1)
+
                     PAD_G.append(g)
 
                 PAD_HT = [-1 for j in range(max_history_len - len(hgs))]

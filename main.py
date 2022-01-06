@@ -8,6 +8,7 @@ import logging
 from collections import namedtuple
 from torch.utils.data import DataLoader
 from utils import set_logger
+import pickle
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser(
@@ -27,7 +28,7 @@ def parse_args(args=None):
 
     parser.add_argument('--d_model', default=100, type=int, help='实体嵌入维度')
     parser.add_argument('--data', default='ICEWS14', type=str, help='使用的数据集名称')
-    parser.add_argument('--max_epochs', default=400, type=int, help='最大训练epoch数量')
+    parser.add_argument('--max_epochs', default=30, type=int, help='最大训练epoch数量')
     parser.add_argument('--lr', default=0.003, type=float, help='学习率')
     parser.add_argument('--do_train', action='store_true', help='执行训练过程')
     parser.add_argument('--do_test', action='store_true', help='执行测试过程')
@@ -44,6 +45,16 @@ def parse_args(args=None):
     parser.add_argument('--nhop', default=1, type=int)
     parser.add_argument('--forecasting_t_win_size', default=1, type=int)
 
+    parser.add_argument('--alpha', default=0.5, type=float)
+    parser.add_argument('--beta', default=1.0, type=float)
+
+    parser.add_argument('--time_span', default=24, type=int)
+    parser.add_argument('--timestep', default=0.1, type=float)
+    parser.add_argument('--hmax', default=5, type=int)
+    parser.add_argument('--eps', default=0.2, type=float)
+    parser.add_argument('--edge_sample', default='one_hop_conf', type=str)
+    parser.add_argument('--desc', default='', type=str)
+
     return parser.parse_args(args)
 
 def test(model, testloader, skip_dict, device):
@@ -57,6 +68,7 @@ def test(model, testloader, skip_dict, device):
     ranks = []
     logs = []
     TimeMSE = 0.
+    TimeMAE = 0.
     with torch.no_grad():
         for sub, rel, obj, time, history_graphs, history_times, batch_node_ids in tqdm(testloader):
             sub = sub.to(device)
@@ -67,29 +79,26 @@ def test(model, testloader, skip_dict, device):
             history_times = history_times.to(device)
             batch_node_ids = batch_node_ids.to(device)
 
-            intes, type = model(sub, rel, history_graphs, history_times, batch_node_ids)
-            score = model.predict_e(intes, type)
+            scores, estimate_dt, dur_last = model.test_forward(sub, rel, obj, time, history_graphs, history_times, batch_node_ids,
+                                                               args.beta)
 
-            # 时间预测
-            last_time, _ = torch.max(history_times, 1)
-            dur_last = time - last_time
-            dur_last = torch.where(last_time > 0, dur_last, torch.zeros_like(dur_last))
-            estimate_dt, dur_last = model.predict_t(obj, dur_last)
-            tp_loss = model.time_prediction_loss(estimate_dt, dur_last)
+            mse_loss = torch.nn.MSELoss(reduction='sum')(estimate_dt, dur_last)
+            mae_loss = torch.nn.L1Loss(reduction='sum')(estimate_dt, dur_last)
 
-            TimeMSE = TimeMSE + tp_loss * sub.size(0)
+            TimeMSE += mse_loss
+            TimeMAE += mae_loss
 
-            _, rank_idx = score.sort(dim=1, descending=True)
+            _, rank_idx = scores.sort(dim=1, descending=True)
             rank = torch.nonzero(rank_idx == obj.view(-1, 1))[:, 1].view(-1)
             ranks.append(rank)
 
-            for i in range(score.shape[0]):
+            for i in range(scores.shape[0]):
                 src_i = sub[i].item()
                 rel_i = rel[i].item()
                 dst_i = obj[i].item()
                 time_i = time[i].item()
 
-                predict_score = score[i].tolist()
+                predict_score = scores[i].tolist()
                 answer_prob = predict_score[dst_i]
                 for e in skip_dict[(src_i, rel_i, time_i)]:
                     if e != dst_i:
@@ -116,6 +125,7 @@ def test(model, testloader, skip_dict, device):
     for metric in logs[0].keys():
         metrics[metric] = sum([log[metric] for log in logs]) / len(logs)
     metrics['Time MSE'] = TimeMSE / len(testloader.dataset)
+    metrics['Time MAE'] = TimeMAE / len(testloader.dataset)
     return metrics
 
 
@@ -134,19 +144,8 @@ def train_epoch(args, model, traindataloader, optimizer, device, epoch):
             history_times = history_times.to(device)
             batch_node_ids = batch_node_ids.to(device)
 
-            score, type = model(sub, rel, history_graphs, history_times, batch_node_ids)
-            lp_loss = model.link_prediction_loss(score, type, obj)
-
-            # 时间预测
-            last_time, _ = torch.max(history_times, 1)
-            dur_last = time - last_time
-            dur_last = torch.where(last_time > 0, dur_last, torch.zeros_like(dur_last))
-
-            estimate_dt, dur_last = model.predict_t(obj, dur_last)
-            tp_loss = model.time_prediction_loss(estimate_dt, dur_last)
-
-            loss = lp_loss + 0.1 * tp_loss
-
+            lp_loss, tp_loss = model.train_forward(sub, rel, obj, time, history_graphs, history_times, batch_node_ids)
+            loss = lp_loss + args.alpha * tp_loss
             loss.backward()
 
             total_loss += loss
@@ -154,6 +153,7 @@ def train_epoch(args, model, traindataloader, optimizer, device, epoch):
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_norm)  # clip gradients
             optimizer.step()
+            optimizer.zero_grad()
 
             bar.update(1)
             bar.set_postfix(loss='%.4f' % loss, lp_loss='%.4f' % lp_loss, tp_loss='%.4f' % tp_loss)
@@ -183,18 +183,21 @@ def main(args):
     statpath = os.path.join(data_path, 'stat.txt')
     baseDataset = BaseDataset(trainpath, testpath, statpath, validpath)
 
-    if 'ICEWS' in args.data:
-        time_span = 24
-    else:
-        time_span = 1
-
     dglGraphDataset = DGLGraphDataset(
         baseDataset.train_snapshots + baseDataset.valid_snapshots + baseDataset.test_snapshots,
         baseDataset.num_e, baseDataset.num_r)
 
+    if args.edge_sample == 'one_hop_conf':
+        edges_conf = pickle.load(open(os.path.join(data_path, 'conf.pkl'), 'rb'))
+        edges_conf = torch.tensor(edges_conf)
+        edge_sample = True
+    else:
+        edges_conf = None
+        edge_sample = False
     trainQuadruples = baseDataset.get_reverse_quadruples_array(baseDataset.trainQuadruples, baseDataset.num_r)
     trainQuadDataset = QuadruplesDataset(trainQuadruples, args.history_len, dglGraphDataset, baseDataset,
-                                         args.history_mode, args.nhop, args.forecasting_t_win_size, time_span)
+                                         args.history_mode, args.nhop, args.forecasting_t_win_size, args.time_span,
+                                         edges_conf, edge_sample, 'train')
     trainDataLoader = DataLoader(
         trainQuadDataset,
         shuffle=True,
@@ -204,8 +207,9 @@ def main(args):
     )
 
     testQuadruples = baseDataset.get_reverse_quadruples_array(baseDataset.testQuadruples, baseDataset.num_r)
-    testQuadDataset = QuadruplesDataset(testQuadruples, args.history_len, dglGraphDataset,
-                                         baseDataset, args.history_mode, args.nhop, args.forecasting_t_win_size, time_span)
+    testQuadDataset = QuadruplesDataset(testQuadruples, args.history_len, dglGraphDataset, baseDataset,
+                                        args.history_mode, args.nhop, args.forecasting_t_win_size, args.time_span,
+                                        edges_conf, edge_sample, 'test')
     testDataLoader = DataLoader(
         testQuadDataset,
         shuffle=False,
@@ -222,7 +226,7 @@ def main(args):
                     dropout=args.dropout,
                     seqTransformerLayerNum=args.seqTransformerLayerNum,
                     seqTransformerHeadNum=args.seqTransformerHeadNum)
-    model = TemporalTransformerHawkesGraphModel(config)
+    model = TemporalTransformerHawkesGraphModel(config, args.eps, args.time_span, args.timestep, args.hmax)
     model.to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -238,23 +242,31 @@ def main(args):
 
         for i in range(args.max_epochs):
             if i % args.valid_epoch == 0 and i != 0:
-                metrics = test(model, testDataLoader, baseDataset.skip_dict, device)
-                model_save_path = os.path.join(output_path, 'model.pth')
+                model_save_path = os.path.join(output_path, 'model_{}.pth'.format(i))
                 torch.save({
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                 }, model_save_path)
 
-                for mode in metrics.keys():
-                    logging.info('Test {} : {}'.format(mode, metrics[mode]))
+                for delta_t in range(args.forecasting_t_win_size):
+                    delta_t = delta_t + 1
+                    testDataLoader.dataset.delta_t = delta_t
+                    metrics = test(model, testDataLoader, baseDataset.skip_dict, device)
+
+                    for mode in metrics.keys():
+                        logging.info('Delta_t {} Test {} : {}'.format(delta_t, mode, metrics[mode]))
 
             train_epoch(args, model, trainDataLoader, optimizer, device, i)
 
     if args.do_test:
         logging.info('Start Testing......')
-        metrics = test(model, testDataLoader, baseDataset.skip_dict, device)
-        for mode in metrics.keys():
-            logging.info('Test {} : {}'.format(mode, metrics[mode]))
+        for delta_t in range(args.forecasting_t_win_size):
+            delta_t = delta_t + 1
+            testDataLoader.dataset.delta_t = delta_t
+            metrics = test(model, testDataLoader, baseDataset.skip_dict, device)
+            for mode in metrics.keys():
+                logging.info('Delta_t {} Test {} : {}'.format(delta_t, mode, metrics[mode]))
+
 
 if __name__ == '__main__':
     args = parse_args()

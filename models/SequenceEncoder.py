@@ -4,6 +4,15 @@ import torch.nn.functional as F
 import math
 import numpy as np
 
+class GRUEncoder(nn.Module):
+    def __init__(self, input_dim, hidden_dim):
+        """这个部分用于序列信息的编码"""
+        super(GRUEncoder, self).__init__()
+        self.rnn = nn.GRU(input_dim, hidden_dim, batch_first=True)
+
+    def forward(self, seq_entities):
+        _, s_h = self.rnn(seq_entities)
+        return s_h[0]
 
 class TimeEncoding(nn.Module):
     def __init__(self, dim_t):
